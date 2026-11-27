@@ -129,6 +129,7 @@ function useThreadActionExecutor(
         for (const kind of ["settle", "snooze", "pin"]) ThreadUndo.invalidate(kind, key);
       }
       onStarted?.();
+      const cleanup = action === "settle" ? thread.source.settlementCleanup : null;
       const result = await withThreadDismissal(
         key,
         async () =>
@@ -151,9 +152,7 @@ function useThreadActionExecutor(
                 environmentId: thread.environmentId,
                 input: {
                   threadId: thread.id,
-                  ...(action === "settle"
-                    ? { settlementCleanup: thread.source.settlementCleanup }
-                    : {}),
+                  ...(cleanup?.state.type === "blocked" ? { settlementCleanup: cleanup } : {}),
                 },
               }),
         (result) => result._tag === "Success",

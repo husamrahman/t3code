@@ -1,4 +1,9 @@
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  ThreadId,
+  type OrchestrationV2ThreadShell,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -53,6 +58,7 @@ const threadShell = vi.hoisted(() => ({
   projectId: "project",
   environmentId: "undo-env",
   session: null,
+  source: { settlementCleanup: null as OrchestrationV2ThreadShell["settlementCleanup"] },
 }));
 // Archived rows have no loaded shell, so deleting one takes the unresolved path.
 const shellLoaded = vi.hoisted(() => ({ current: true }));
@@ -108,12 +114,27 @@ beforeEach(() => {
   router.state.matches[0]!.params = {};
   threadShell.pinnedAt = null;
   threadShell.snoozedUntil = null;
+  threadShell.source.settlementCleanup = null;
   shellLoaded.current = true;
 });
 afterEach(() => {
   vi.runAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+it("passes the observed cleanup blocker when the user settles again", async () => {
+  const cleanup = {
+    intentId: CommandId.make("settle-intent"),
+    attemptId: CommandId.make("blocked-attempt"),
+    state: { type: "blocked", reason: "Ignored files.", remaining: [] },
+  } as const;
+  threadShell.source.settlementCleanup = cleanup;
+  await useThreadActions().settleThread(target);
+  expect(commands.settle).toHaveBeenCalledWith({
+    environmentId: target.environmentId,
+    input: { threadId: target.threadId, settlementCleanup: cleanup },
+  });
 });
 
 describe("concurrent thread action Undo", () => {
