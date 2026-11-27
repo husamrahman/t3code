@@ -764,9 +764,13 @@ export function useThreadActions() {
     ThreadUndo.invalidate("pin", scopedThreadKey(target));
     ThreadUndo.invalidate("snooze", scopedThreadKey(target));
     const action = ThreadUndo.begin("settle", scopedThreadKey(target));
+    const cleanup = resolved?.thread.source.settlementCleanup;
     const result = await settleThreadMutation({
       environmentId: target.environmentId,
-      input: { threadId: target.threadId },
+      input: {
+        threadId: target.threadId,
+        ...(cleanup?.state.type === "blocked" ? { settlementCleanup: cleanup } : {}),
+      },
     });
     if (result._tag !== "Success") {
       action.finish();

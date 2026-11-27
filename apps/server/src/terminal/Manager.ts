@@ -2,6 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import * as SettlementResourceAdmission from "../orchestration-v2/SettlementResourceAdmission.ts";
 import {
   DEFAULT_TERMINAL_ID,
   DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
@@ -16,6 +17,7 @@ import {
   TerminalProviderEnvironmentError,
   TerminalResizeError,
   TerminalSessionLookupError,
+  TerminalSettlementError,
   TerminalWriteError,
   type TerminalAttachInput,
   type TerminalAttachStreamEvent,
@@ -217,12 +219,15 @@ export class TerminalManager extends Context.Service<
     readonly clear: (input: TerminalClearInput) => Effect.Effect<void, TerminalError>;
 
     /** Omit terminalId to close all sessions for the thread. */
-    readonly close: (input: TerminalCloseInput) => Effect.Effect<void, TerminalError>;
+    readonly close: (
+      input: TerminalCloseInput & { readonly verifyExit?: boolean },
+    ) => Effect.Effect<void, TerminalError>;
 
     readonly closeIdle: (input: {
       readonly threadId: string;
       readonly terminalId?: string;
     }) => Effect.Effect<void>;
+    readonly listForSettlement?: () => Effect.Effect<ReadonlyArray<TerminalSummary>>;
 
     readonly subscribe: (
       listener: (event: TerminalEvent) => Effect.Effect<void>,
@@ -1507,6 +1512,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
 export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(function* (
   options: TerminalManagerOptions,
 ) {
+  const admission = yield* SettlementResourceAdmission.SettlementResourceAdmission;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const context = yield* Effect.context<never>();
@@ -1831,13 +1837,15 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     process: PtyAdapter.PtyProcess,
     threadId: string,
     terminalId: string,
+    verifyExit = false,
   ) {
     // Subscribe before SIGTERM to catch immediate exits; Effect.ensuring releases even on interruption, unlike JS finally.
     const exited = Deferred.makeUnsafe<void>();
     const unsubscribeExit = process.onExit(() => {
       Deferred.doneUnsafe(exited, Effect.void);
     });
-    yield* Effect.gen(function* () {
+    return yield* Effect.gen(function* () {
+      if (yield* Deferred.isDone(exited)) return true;
       const terminated = yield* Effect.try({
         try: () => process.kill("SIGTERM"),
         catch: (cause) =>
@@ -1849,16 +1857,18 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       }).pipe(
         Effect.as(true),
         Effect.catch((error) =>
-          Effect.logWarning("failed to kill terminal process", {
-            threadId,
-            terminalId,
-            signal: "SIGTERM",
-            cause: error,
-          }).pipe(Effect.as(false)),
+          PortScanner.isNoSuchProcess(error.cause)
+            ? Deferred.succeed(exited, undefined).pipe(Effect.as(true))
+            : Effect.logWarning("failed to kill terminal process", {
+                threadId,
+                terminalId,
+                signal: "SIGTERM",
+                cause: error,
+              }).pipe(Effect.as(false)),
         ),
       );
       if (!terminated) {
-        return;
+        return false;
       }
 
       const exitedBeforeGrace = yield* Deferred.await(exited).pipe(
@@ -1869,7 +1879,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         }),
       );
       if (exitedBeforeGrace) {
-        return;
+        return true;
       }
 
       yield* Effect.try({
@@ -1882,14 +1892,25 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           }),
       }).pipe(
         Effect.catch((error) =>
-          Effect.logWarning("failed to force-kill terminal process", {
-            threadId,
-            terminalId,
-            signal: "SIGKILL",
-            cause: error,
-          }),
+          PortScanner.isNoSuchProcess(error.cause)
+            ? Deferred.succeed(exited, undefined).pipe(Effect.asVoid)
+            : Effect.logWarning("failed to force-kill terminal process", {
+                threadId,
+                terminalId,
+                signal: "SIGKILL",
+                cause: error,
+              }),
         ),
       );
+      return verifyExit
+        ? yield* Deferred.await(exited).pipe(
+            Effect.as(true),
+            Effect.timeoutOrElse({
+              duration: processKillGraceMs,
+              orElse: () => Effect.succeed(false),
+            }),
+          )
+        : false;
     }).pipe(Effect.ensuring(Effect.sync(unsubscribeExit)));
   });
 
@@ -1899,6 +1920,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     terminalId: string,
   ) {
     const fiber = yield* runKillEscalation(process, threadId, terminalId).pipe(
+      Effect.asVoid,
       Effect.ensuring(
         modifyManagerState((state) => {
           if (!state.killFibers.has(process)) {
@@ -2443,6 +2465,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
               platform,
               yield* HostProcess.HomeDirectory,
             );
+            terminalEnv[PortScanner.AGENT_THREAD_ENV] = session.threadId;
             // Append managed install directories so agent commands resolve without shadowing user/system tools.
             if (
               options.managedBinaryCacheDir !== undefined &&
@@ -2574,12 +2597,25 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     threadId: string,
     terminalId: string,
     deleteHistoryOnClose: boolean,
+    verifyExit = false,
   ) {
     const key = toSessionKey(threadId, terminalId);
     const session = yield* getSession(threadId, terminalId);
     const closedEventSequence = Option.isSome(session) ? session.value.eventSequence + 1 : 0;
 
     if (Option.isSome(session)) {
+      const process = session.value.process;
+      if (verifyExit && process !== null) {
+        if (!(yield* runKillEscalation(process, threadId, terminalId, true))) {
+          return yield* new TerminalSettlementError({
+            threadId,
+            terminalId,
+            detail: "The terminal process did not exit.",
+          });
+        }
+        session.value.process = null;
+        cleanupProcessHandles(session.value);
+      }
       yield* stopProcess(session.value);
       yield* unregisterTerminal({ threadId, terminalId });
       yield* persistHistory(threadId, terminalId, session.value.history);
@@ -2825,6 +2861,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const openWithWorkspaceLease = Effect.fn("terminal.openLocked")(function* (
     requestedInput: TerminalOpenInput,
   ) {
+    if (!(yield* admission.permitsStart(requestedInput.threadId))) {
+      return yield* new TerminalSettlementError({
+        threadId: requestedInput.threadId,
+        terminalId: requestedInput.terminalId,
+        detail:
+          "Open the thread before starting a terminal. Settlement cleanup may still be pending.",
+      });
+    }
     const terminalId = requestedInput.terminalId;
     yield* assertValidCwd(requestedInput.cwd);
 
@@ -3394,14 +3438,19 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       input.threadId,
       Effect.gen(function* () {
         if (input.terminalId) {
-          yield* closeSession(input.threadId, input.terminalId, input.deleteHistory === true);
+          yield* closeSession(
+            input.threadId,
+            input.terminalId,
+            input.deleteHistory === true,
+            input.verifyExit,
+          );
           return;
         }
 
         const threadSessions = yield* sessionsForThread(input.threadId);
         yield* Effect.forEach(
           threadSessions,
-          (session) => closeSession(input.threadId, session.terminalId, false),
+          (session) => closeSession(input.threadId, session.terminalId, false, input.verifyExit),
           { discard: true },
         );
 
@@ -3465,6 +3514,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     clear,
     close,
     closeIdle,
+    listForSettlement: readAllTerminalMetadata,
     subscribe,
     subscribeMetadata,
   });

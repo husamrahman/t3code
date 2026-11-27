@@ -34,6 +34,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { expect, vi } from "vite-plus/test";
 
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import { SettlementResourceAdmission } from "../orchestration-v2/SettlementResourceAdmission.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -414,6 +415,31 @@ it.layer(
   ),
   { excludeTestServices: true },
 )("TerminalManager", (it) => {
+  it.effect("uses settlement admission supplied only during terminal construction", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager().pipe(
+        Effect.provideService(SettlementResourceAdmission, {
+          permitsStart: () => Effect.succeed(false),
+        }),
+      );
+      const error = yield* manager.open(openInput()).pipe(Effect.flip);
+      expect(error._tag).toBe("TerminalSettlementError");
+      expect(ptyAdapter.spawnInputs).toHaveLength(0);
+    }),
+  );
+
+  it.effect("verifies a terminal that exits before settlement signals it", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = openInput();
+      yield* manager.open(input);
+      ptyAdapter.processes[0]!.onKill = () => {
+        throw Object.assign(new Error("Process exited"), { code: "ESRCH" });
+      };
+      yield* manager.close({ threadId: input.threadId, verifyExit: true });
+      expect(yield* manager.listForSettlement!()).toEqual([]);
+    }),
+  );
   it.effect("spawns lazily and reuses running terminal per thread", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();

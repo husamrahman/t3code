@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import { reportSettlementFixture } from "./testkit/settlementFixtures.ts";
 import {
   CommandId,
   GuestMessageId,
@@ -324,6 +325,7 @@ it.effect("brings a settled thread back when its guest sends a request", () =>
       commandId: CommandId.make("settle"),
       threadId,
     });
+    yield* reportSettlementFixture(orchestrator, threadId);
     assert.equal(
       (yield* projections.getThreadProjection(threadId)).thread.settledOverride,
       "settled",

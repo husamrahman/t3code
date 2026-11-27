@@ -60,6 +60,9 @@ export class PortDiscovery extends Context.Service<
     readonly stopServer: (
       input: PreviewStopLocalServerInput,
     ) => Effect.Effect<void, PreviewStopLocalServerError>;
+    readonly stopThreadProcesses: (
+      threadId: ThreadId,
+    ) => Effect.Effect<void, PreviewStopLocalServerError>;
   }
 >()("t3/preview/PortScanner/PortDiscovery") {}
 
@@ -444,7 +447,7 @@ const serversEqual = (
   return true;
 };
 
-const isNoSuchProcess = (cause: unknown): boolean =>
+export const isNoSuchProcess = (cause: unknown): boolean =>
   typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ESRCH";
 
 const isCommandNotFound = (error: ProcessRunner.ProcessSpawnError): boolean =>
@@ -1042,25 +1045,57 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     if (!table.has(input.pid)) return;
     const group = stoppableProcessGroup(table, input.pid, process.pid);
     if (group === null) return yield* new PreviewStopLocalServerError({ reason: "shared-group" });
-    // False when the whole group already exited.
-    const signalGroup = (signal: "SIGTERM" | "SIGKILL") =>
-      Effect.suspend(() => {
-        try {
-          signalProcessGroup(group, signal);
-          return Effect.succeed(true);
-        } catch (cause) {
-          return isNoSuchProcess(cause)
-            ? Effect.succeed(false)
-            : Effect.fail(new PreviewStopLocalServerError({ reason: "signal-failed", cause }));
-        }
-      });
+    yield* stopProcessGroup(group, table);
+  });
+
+  const hasThreadTag = Effect.fn("PortDiscovery.hasThreadTag")(function* (
+    pid: number,
+    threadId: ThreadId,
+  ) {
+    return yield* fileSystem.readFileString(`/proc/${pid}/environ`).pipe(
+      Effect.map((environment) => parseProcEnvironThread(environment) === threadId),
+      Effect.orElseSucceed(() => false),
+    );
+  });
+
+  const stopProcessGroup = Effect.fn("PortDiscovery.stopProcessGroup")(function* (
+    group: number,
+    table: ReadonlyMap<number, ProcessTableRow>,
+    threadId?: ThreadId,
+  ) {
+    const members = [...table.values()].filter((row) => row.pgid === group).map((row) => row.pid);
+    const signalGroup = Effect.fn("PortDiscovery.signalProcessGroup")(function* (
+      signal: "SIGTERM" | "SIGKILL",
+    ) {
+      if (threadId !== undefined) {
+        const current = yield* readProcessTable;
+        if (!members.some((pid) => current.get(pid)?.pgid === group)) return false;
+        const active = [...current.values()].filter(({ pgid }) => pgid === group);
+        const owned = yield* Effect.filter(active, ({ pid }) => hasThreadTag(pid, threadId), {
+          concurrency: 16,
+        });
+        if (
+          owned.length !== active.length ||
+          stoppableProcessGroup(current, active[0]!.pid, process.pid) !== group
+        )
+          return yield* new PreviewStopLocalServerError({ reason: "shared-group" });
+      }
+      return yield* Effect.try({
+        try: () => signalProcessGroup(group, signal),
+        catch: (cause) => new PreviewStopLocalServerError({ reason: "signal-failed", cause }),
+      }).pipe(
+        Effect.as(true),
+        Effect.catchIf(
+          (error) => isNoSuchProcess(error.cause),
+          () => Effect.succeed(false),
+        ),
+      );
+    });
     if (!(yield* signalGroup("SIGTERM"))) return;
     // While one of the group's original members is still in it, the group has not been reused,
     // so SIGKILL goes only to the job that ignored SIGTERM.
-    const members = [...table.values()].filter((row) => row.pgid === group).map((row) => row.pid);
     const jobRunning = readProcessTable.pipe(
       Effect.map((current) => members.some((pid) => current.get(pid)?.pgid === group)),
-      Effect.orElseSucceed(() => false),
     );
     const deadline = (yield* Clock.currentTimeMillis) + STOP_GRACE_MS;
     while ((yield* Clock.currentTimeMillis) < deadline) {
@@ -1068,6 +1103,43 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       if (!(yield* jobRunning)) return;
     }
     yield* signalGroup("SIGKILL");
+    if (threadId !== undefined) {
+      yield* Effect.sleep(STOP_POLL_INTERVAL);
+      if (yield* jobRunning)
+        return yield* new PreviewStopLocalServerError({ reason: "signal-failed" });
+    }
+  });
+
+  const stopThreadProcesses = Effect.fn("PortDiscovery.stopThreadProcesses")(function* (
+    threadId: ThreadId,
+  ) {
+    if (hostPlatform !== "linux")
+      return yield* new PreviewStopLocalServerError({ reason: "unsupported" });
+    const tagged = Effect.fn("PortDiscovery.readLiveThreadProcessTags")(function* (
+      table: ReadonlyMap<number, ProcessTableRow>,
+    ) {
+      return new Set(
+        yield* Effect.filter([...table.keys()], (pid) => hasThreadTag(pid, threadId), {
+          concurrency: 16,
+        }),
+      );
+    });
+    const before = yield* readProcessTable;
+    const owned = yield* tagged(before);
+    const groups = new Set<number>();
+    for (const pid of owned) {
+      const group = stoppableProcessGroup(before, pid, process.pid);
+      if (
+        group === null ||
+        [...before.values()].some((row) => row.pgid === group && !owned.has(row.pid))
+      ) {
+        return yield* new PreviewStopLocalServerError({ reason: "shared-group" });
+      }
+      groups.add(group);
+    }
+    for (const group of groups) yield* stopProcessGroup(group, before, threadId);
+    if ((yield* tagged(yield* readProcessTable)).size !== 0)
+      return yield* new PreviewStopLocalServerError({ reason: "signal-failed" });
   });
 
   const stopServer: PortDiscovery["Service"]["stopServer"] = (input) =>
@@ -1082,6 +1154,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     unregisterTerminal,
     trackAgent,
     stopServer,
+    stopThreadProcesses,
   });
 }).pipe(Effect.withSpan("PortDiscovery.make"));
 

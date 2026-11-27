@@ -8,6 +8,7 @@ import * as PubSub from "effect/PubSub";
 import { expect } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
+import { SettlementResourceAdmission } from "../orchestration-v2/SettlementResourceAdmission.ts";
 import * as PreviewManager from "./Manager.ts";
 
 const DRAIN_LIMIT = 100;
@@ -36,6 +37,25 @@ const layer = PreviewManager.layer.pipe(
   Layer.provide(NodeServices.layer),
 );
 
+it.effect("uses settlement admission supplied only to the preview manager layer", () =>
+  Effect.gen(function* () {
+    const manager = yield* PreviewManager.PreviewManager;
+    const threadId = freshThreadId();
+    const error = yield* manager.open({ threadId }).pipe(Effect.flip);
+    expect(error._tag).toBe("PreviewSettlementError");
+    expect((yield* manager.list({ threadId })).sessions).toEqual([]);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(
+          Layer.succeed(SettlementResourceAdmission, {
+            permitsStart: () => Effect.succeed(false),
+          }),
+        ),
+      ),
+    ),
+  ),
+);
 it.layer(layer)("PreviewManager", (it) => {
   it.effect("opens a session and emits opened with normalized URL", () =>
     Effect.gen(function* () {

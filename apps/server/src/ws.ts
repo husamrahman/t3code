@@ -2032,6 +2032,13 @@ export const layerWsRpc = (
                   Effect.tap((result) =>
                     result.replayed ? Effect.void : recordClientCommandAnalytics(command),
                   ),
+                  Effect.tap(() =>
+                    command.type === "thread.settle" &&
+                    command.acknowledgeCleanup !== true &&
+                    (command.retryCleanup === undefined || command.acknowledgeCleanup === false)
+                      ? threadManagement.waitForSettlement(command)
+                      : Effect.void,
+                  ),
                   Effect.map((result) => ({ sequence: result.sequence })),
                   Effect.mapError((cause) => {
                     const detail = userFacingDispatchErrorMessage(cause);

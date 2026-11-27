@@ -195,6 +195,7 @@ import * as RuntimeLayer from "./orchestration-v2/runtimeLayer.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as ThreadSettlementService from "./orchestration-v2/ThreadSettlementService.ts";
+import * as SettlementResourceAdmission from "./orchestration-v2/SettlementResourceAdmission.ts";
 import * as IdleCompactionService from "./orchestration-v2/IdleCompactionService.ts";
 import * as ThreadPullRequestService from "./orchestration-v2/ThreadPullRequestService.ts";
 import * as RunFinalizationService from "./orchestration-v2/RunFinalizationService.ts";
@@ -485,13 +486,14 @@ const layerCheckpointStore = CheckpointStore.layer.pipe(Layer.provide(layerVcsDr
 const layerPortScanner = PortScanner.layer.pipe(Layer.provide(ProcessRunner.layer));
 
 const layerTerminal = TerminalManager.layer.pipe(
+  Layer.provide(SettlementResourceAdmission.layer),
   Layer.provide(layerPtyAdapter),
   Layer.provide(layerPortScanner),
   Layer.provide(layerNativeTelemetry),
 );
 
 const layerPreview = Layer.empty.pipe(
-  Layer.provideMerge(PreviewManager.layer),
+  Layer.provideMerge(PreviewManager.layer.pipe(Layer.provide(SettlementResourceAdmission.layer))),
   Layer.provideMerge(layerPortScanner),
 );
 

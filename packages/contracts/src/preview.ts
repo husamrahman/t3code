@@ -398,7 +398,17 @@ export class PreviewClearProfileError extends Schema.TaggedError<PreviewClearPro
   }
 }
 
+export class PreviewSettlementError extends Schema.TaggedError<PreviewSettlementError>()(
+  "PreviewSettlementError",
+  { threadId: ThreadId },
+) {
+  override get message() {
+    return "Open the thread before starting a preview. Settlement cleanup may still be pending.";
+  }
+}
+
 export const PreviewError = Schema.Union([
+  PreviewSettlementError,
   PreviewSessionLookupError,
   PreviewInvalidUrlError,
   PreviewControlRequiredError,

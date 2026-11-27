@@ -33,6 +33,7 @@ const state = vi.hoisted(() => ({
     worktreePath: string | null;
     session: { status: "ready" | "stopped" } | null;
     latestTurn: null;
+    source: { settlementCleanup: null };
   }[],
   requests: [] as { action: string; environmentId: string; input: { threadId?: string } }[],
   localEffects: [] as string[],
@@ -240,6 +241,7 @@ beforeEach(() => {
       worktreePath: null,
       session: null,
       latestTurn: null,
+      source: { settlementCleanup: null },
     },
   ];
   state.requests = [];

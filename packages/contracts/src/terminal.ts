@@ -362,7 +362,17 @@ export class TerminalResizeError extends Schema.TaggedError<TerminalResizeError>
   }
 }
 
+export class TerminalSettlementError extends Schema.TaggedError<TerminalSettlementError>()(
+  "TerminalSettlementError",
+  { threadId: Schema.String, terminalId: Schema.optional(Schema.String), detail: Schema.String },
+) {
+  override get message() {
+    return this.detail;
+  }
+}
+
 export const TerminalError = Schema.Union([
+  TerminalSettlementError,
   TerminalCwdError,
   TerminalHistoryError,
   TerminalSessionLookupError,
