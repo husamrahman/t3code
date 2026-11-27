@@ -140,6 +140,16 @@ export const layer = Layer.effect(
           return yield* Effect.fail(`Terminal ${terminal.terminalId} still uses the worktree.`);
         }
       }
+      const processDirs = (yield* fs.readDirectory("/proc")).filter((entry) => /^\d+$/.test(entry));
+      const worktreeUser = yield* Effect.findFirst(processDirs, (pid) =>
+        fs.realPath(`/proc/${pid}/cwd`).pipe(
+          Effect.map((cwd) => cwd === realWorktree || cwd.startsWith(realWorktree + path.sep)),
+          Effect.orElseSucceed(() => false),
+        ),
+      );
+      if (Option.isSome(worktreeUser)) {
+        return yield* Effect.fail(`Process ${worktreeUser.value} still uses the worktree.`);
+      }
 
       const readGit = Effect.fn("SettlementResources.inspectWorktree")(function* (
         args: ReadonlyArray<string>,
