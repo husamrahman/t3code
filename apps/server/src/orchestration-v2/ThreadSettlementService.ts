@@ -26,11 +26,9 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as GitManager from "../git/GitManager.ts";
-import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
-import * as TerminalManager from "../terminal/Manager.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -148,6 +146,11 @@ export function isAutoSettlementCandidate(
   nowMs: number,
 ): boolean {
   if (thread.archivedAt !== null || thread.settledOverride !== null) return false;
+  if (
+    thread.settlementCleanup?.state.type === "pending" ||
+    thread.settlementCleanup?.state.type === "blocked"
+  )
+    return false;
   if (thread.pinnedAt != null || thread.autoSettleDisabledAt != null) return false;
   if (thread.pendingRuntimeRequest !== null) return false;
   // A guest is waiting on the owner; settling would hide the Request.
@@ -302,10 +305,7 @@ export const make = Effect.gen(function* () {
   // A shell merge or close sends no event, and the branch lookup caches an open pull request for
   // a minute, so these threads' next lookup reads the host fresh.
   const shellClosedThreads = new Set<ThreadId>();
-  const terminals = yield* TerminalManager.TerminalManager;
-  const projectScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
-  const settleActionRunAt = new Map<ThreadId, number>();
 
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
@@ -587,48 +587,8 @@ export const make = Effect.gen(function* () {
       return sweepThread(threadId).pipe(FiberSet.run(threadSweeps), Effect.asVoid);
     });
 
-  // Skip settle scripts in shared checkouts where other threads may still work.
-  const cleanUpSettledThread = Effect.fn("ThreadSettlementServiceV2.cleanUpSettledThread")(
-    function* (threadId: ThreadId) {
-      const settled = yield* projections.getThread(threadId);
-      if (settled.settledOverride !== "settled") return;
-      yield* terminals.closeIdle({ threadId });
-      const worktreePath = settled.worktreePath;
-      if (worktreePath === null || !(yield* fileSystem.exists(worktreePath))) return;
-      // Recheck after closing and worktree I/O; re-engaged threads must not be cleaned up.
-      const thread = yield* projections.getThread(threadId);
-      if (thread.settledOverride !== "settled") return;
-      const settledAtMs = toMillis(thread.settledAt);
-      if (settledAtMs === null || settleActionRunAt.get(threadId) === settledAtMs) return;
-      const run = yield* projectScripts.runForThread({
-        threadId,
-        projectId: thread.projectId,
-        worktreePath,
-        trigger: "settle",
-        observeCompletion: {},
-      });
-      settleActionRunAt.set(threadId, settledAtMs);
-      if (run.status === "started" && run.completion) {
-        yield* run.completion.pipe(Effect.forkDetach);
-      }
-    },
-    (effect, threadId) =>
-      effect.pipe(
-        Effect.catchCauseIf(
-          (cause) => !Cause.hasInterruptsOnly(cause),
-          (cause) =>
-            Effect.logWarning("cleaning up a settled thread failed", {
-              threadId,
-              cause: Cause.pretty(cause),
-            }),
-        ),
-      ),
-  );
-
   const processEvent = (event: OrchestrationV2DomainEvent) => {
     switch (event.type) {
-      case "thread.settled":
-        return cleanUpSettledThread(event.threadId);
       case "thread.pull-request-link-updated":
       case "thread.pull-request-synced":
       case "provider-session.detached":

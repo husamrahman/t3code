@@ -26,6 +26,7 @@ import * as KnownWorkspaces from "./KnownWorkspaces.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 import { fileHeaderMimeType } from "./fileHeaderMimeType.ts";
+import { withWorkspaceLease } from "./workspaceLease.ts";
 
 const PROJECT_READ_FILE_MAX_BYTES = 1024 * 1024;
 
@@ -542,55 +543,58 @@ export const make = Effect.gen(function* () {
 
   const writeFile: WorkspaceFileSystem["Service"]["writeFile"] = Effect.fn(
     "WorkspaceFileSystem.writeFile",
-  )(function* (input) {
-    yield* knownWorkspaces.assertContains(input.cwd);
-    const target = yield* resolveWriteTarget(input);
-    const realTargetPath = target.realTargetPath;
-    const replacesFile = yield* fileSystem
-      .exists(realTargetPath)
-      .pipe(Effect.orElseSucceed(() => false));
+  )(
+    function* (input) {
+      yield* knownWorkspaces.assertContains(input.cwd);
+      const target = yield* resolveWriteTarget(input);
+      const realTargetPath = target.realTargetPath;
+      const replacesFile = yield* fileSystem
+        .exists(realTargetPath)
+        .pipe(Effect.orElseSucceed(() => false));
 
-    yield* fileSystem.makeDirectory(path.dirname(realTargetPath), { recursive: true }).pipe(
-      Effect.mapError(
-        (cause) =>
+      yield* fileSystem.makeDirectory(path.dirname(realTargetPath), { recursive: true }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new WorkspaceFileSystemOperationError({
+              workspaceRoot: input.cwd,
+              relativePath: input.relativePath,
+              resolvedPath: realTargetPath,
+              operationPath: path.dirname(realTargetPath),
+              operation: "make-directory",
+              cause,
+            }),
+        ),
+      );
+      yield* Effect.tryPromise({
+        // A symlink swapped in after the check is not followed. Windows lacks O_NOFOLLOW.
+        try: () =>
+          NodeFSP.writeFile(realTargetPath, input.contents, {
+            flag:
+              NodeFS.constants.O_WRONLY |
+              NodeFS.constants.O_CREAT |
+              NodeFS.constants.O_TRUNC |
+              (NodeFS.constants.O_NOFOLLOW ?? 0),
+          }),
+        catch: (cause) =>
           new WorkspaceFileSystemOperationError({
             workspaceRoot: input.cwd,
             relativePath: input.relativePath,
             resolvedPath: realTargetPath,
-            operationPath: path.dirname(realTargetPath),
-            operation: "make-directory",
+            operationPath: realTargetPath,
+            operation: "write-file",
             cause,
           }),
-      ),
-    );
-    yield* Effect.tryPromise({
-      // A symlink swapped in after the check is not followed. Windows lacks O_NOFOLLOW.
-      try: () =>
-        NodeFSP.writeFile(realTargetPath, input.contents, {
-          flag:
-            NodeFS.constants.O_WRONLY |
-            NodeFS.constants.O_CREAT |
-            NodeFS.constants.O_TRUNC |
-            (NodeFS.constants.O_NOFOLLOW ?? 0),
-        }),
-      catch: (cause) =>
-        new WorkspaceFileSystemOperationError({
-          workspaceRoot: input.cwd,
-          relativePath: input.relativePath,
-          resolvedPath: realTargetPath,
-          operationPath: realTargetPath,
-          operation: "write-file",
-          cause,
-        }),
-    });
-    // Editor autosave overwrites existing files, which leaves the indexed paths unchanged, and
-    // fff's watcher applies the new contents on its own. A forced rescan re-walks the whole
-    // workspace, and the save would wait for it.
-    if (!replacesFile) {
-      yield* workspaceEntries.refresh(input.cwd);
-    }
-    return { relativePath: target.relativePath };
-  });
+      });
+      // Editor autosave overwrites existing files, which leaves the indexed paths unchanged, and
+      // fff's watcher applies the new contents on its own. A forced rescan re-walks the whole
+      // workspace, and the save would wait for it.
+      if (!replacesFile) {
+        yield* workspaceEntries.refresh(input.cwd);
+      }
+      return { relativePath: target.relativePath };
+    },
+    (effect, input) => withWorkspaceLease(path.resolve(input.cwd), effect),
+  );
 
   return WorkspaceFileSystem.of({ getMetadata, readFile, writeFile });
 });

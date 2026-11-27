@@ -1,6 +1,7 @@
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
+import { reportSettlementFixture } from "./testkit/settlementFixtures.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -1947,6 +1948,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         commandId: CommandId.make("runtime-settle-question-command"),
         threadId: settled.threadId,
       });
+      yield* reportSettlementFixture(orchestrator, settled.threadId);
       const settledProjection = yield* orchestrator.getThreadProjection(settled.threadId);
       assert.equal(settledProjection.thread.settledOverride, "settled");
       assert.equal(settledProjection.runtimeRequests[0]?.status, "resolved");
@@ -2615,6 +2617,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
         snapshotAt: preAutoProjection.thread.updatedAt,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       const autoSettledProjection = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(autoSettledProjection.thread.settledOverride, "settled");
       assert.isNull(autoSettledProjection.thread.activeOrderKey);
@@ -2640,6 +2643,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("runtime-layer-lifecycle-settle"),
         threadId,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       const settledProjection = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(settledProjection.thread.settledOverride, "settled");
       assert.isNotNull(settledProjection.thread.settledAt);
@@ -2664,6 +2668,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("runtime-layer-lifecycle-resettle"),
         threadId,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       yield* orchestrator.dispatch({
         type: "thread.pin",
         commandId: CommandId.make("runtime-layer-lifecycle-pin-settled"),
@@ -3085,6 +3090,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make(`pr-watch-settle-${mode}`),
         threadId,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       const expected = before.pullRequests?.map(({ watch, ...link }) => ({
         ...link,
         endedWatch: watch,
@@ -4542,6 +4548,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("runtime-layer-active-settle-initial"),
         threadId,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       yield* orchestrator.dispatch({
         type: "message.dispatch",
         createdBy: "user",
@@ -4621,9 +4628,21 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0];
       if (run === undefined) return yield* Effect.die(new Error("Run missing."));
 
-      const settled = yield* orchestrator
-        .streamStoredEventsFrom({ threadId, afterSequence: 0, eventType: "thread.settled" })
-        .pipe(Stream.runHead, Effect.forkChild);
+      const pending = yield* orchestrator
+        .streamStoredEventsFrom({
+          threadId,
+          afterSequence: 0,
+          eventType: "thread.metadata-updated",
+        })
+        .pipe(
+          Stream.filter(
+            ({ event }) =>
+              event.type === "thread.metadata-updated" &&
+              event.payload.settlementCleanup?.state.type === "pending",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
       const result = yield* threadManagement.settleThread({
         threadId,
         commandId: CommandId.make("runtime-layer-settle-after-run-settle"),
@@ -4645,7 +4664,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           },
         ],
       });
-      yield* Fiber.join(settled);
+      yield* Fiber.join(pending);
+      yield* reportSettlementFixture(orchestrator, threadId);
 
       const projection = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(projection.thread.settledOverride, "settled");
@@ -4740,6 +4760,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("settle-automatic-settle"),
         threadId,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       const settled = yield* orchestrator.getThreadProjection(threadId);
       assert.isNotNull(settled.thread.settledAt);
       assert.isTrue(settled.runs.every((run) => run.status === "cancelled"));
@@ -7179,6 +7200,7 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
         commandId: CommandId.make("runtime-layer-snoozed-thread-settle"),
         threadId,
       });
+      yield* reportSettlementFixture(orchestrator, threadId);
       yield* orchestrator.dispatch({
         type: "thread.snooze",
         commandId: CommandId.make("runtime-layer-snoozed-thread-snooze-after-wake"),

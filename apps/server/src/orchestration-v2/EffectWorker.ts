@@ -18,6 +18,7 @@ import {
 } from "../observability/Metrics.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
+import * as SettlementResources from "./SettlementResources.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -85,6 +86,7 @@ export const layerExecutor: Layer.Layer<
   Effect.gen(function* () {
     const runFinalization = yield* RunFinalizationService.RunFinalizationService;
     const resourceCleanup = yield* ResourceCleanupService.ResourceCleanupService;
+    const settlementResources = yield* SettlementResources.SettlementResources;
     const checkpointRollback = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const providerTurnControl = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
@@ -516,6 +518,43 @@ export const layerExecutor: Layer.Layer<
                   }),
               ),
             );
+          case "thread.settlement.cleanup": {
+            const { intentId, settledAt } = effect.request;
+            const settle = Effect.gen(function* () {
+              const shell = yield* threads.getThreadShell(effect.threadId);
+              const cleanup = shell?.settlementCleanup;
+              if (
+                cleanup?.state.type !== "pending" ||
+                cleanup.intentId !== intentId ||
+                cleanup.attemptId !== effect.commandId
+              )
+                return;
+              const result = yield* Effect.result(settlementResources.cleanup(effect.threadId));
+              const blocker =
+                result._tag === "Failure"
+                  ? { reason: result.failure.reason, remaining: result.failure.remaining }
+                  : null;
+              yield* threads.dispatch({
+                type: "thread.settlement-cleanup.report",
+                commandId: CommandId.make(`server:settlement-cleanup:${effect.commandId}`),
+                threadId: effect.threadId,
+                intentId,
+                attemptId: effect.commandId,
+                ...(settledAt === undefined ? {} : { settledAt }),
+                blocker,
+              });
+            });
+            return settle.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
+          }
           case "preview.cleanup":
             return resourceCleanup.cleanupPreviews(effect.threadId).pipe(
               Effect.mapError(
@@ -819,7 +858,8 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : effect.attemptCount >= maxAttempts &&
+                effect.request.type !== "thread.settlement.cleanup"
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

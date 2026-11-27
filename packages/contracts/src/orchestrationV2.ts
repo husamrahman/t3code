@@ -441,6 +441,24 @@ const LenientThreadOpens = Schema.NullOr(OrchestrationV2ThreadOpens).pipe(
   Schema.catchDecoding(() => Effect.succeedSome(null)),
 );
 
+const SettlementResource = Schema.Struct({
+  kind: Schema.Literals(["provider", "terminal", "preview", "process", "worktree"]),
+  id: Schema.String,
+});
+const SettlementBlocker = Schema.Struct({
+  reason: Schema.String,
+  remaining: Schema.Array(SettlementResource),
+});
+const SettlementCleanup = Schema.Struct({
+  intentId: CommandId,
+  attemptId: CommandId,
+  state: Schema.Union([
+    Schema.Struct({ type: Schema.Literal("pending") }),
+    Schema.Struct({ type: Schema.Literal("blocked"), ...SettlementBlocker.fields }),
+    Schema.Struct({ type: Schema.Literal("complete") }),
+  ]),
+});
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -480,6 +498,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   settledAt: Schema.NullOr(Schema.DateTimeUtc).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  settlementCleanup: Schema.optional(Schema.NullOr(SettlementCleanup)),
   unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -2127,6 +2146,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   archivedAt: Schema.NullOr(Schema.DateTimeUtc),
   settledOverride: Schema.NullOr(Schema.Literals(["settled", "active"])),
   settledAt: Schema.NullOr(Schema.DateTimeUtc),
+  settlementCleanup: Schema.optional(Schema.NullOr(SettlementCleanup)),
   unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -2964,6 +2984,8 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     settledAt: Schema.optional(Schema.DateTimeUtc),
+    acknowledgeCleanup: Schema.optional(Schema.Literal(true)),
+    retryCleanup: Schema.optional(Schema.Struct({ intentId: CommandId, attemptId: CommandId })),
   }),
   /** Rejects changes since snapshotAt or any explicit settled override to preserve user actions. */
   Schema.Struct({
@@ -3374,6 +3396,15 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
 
 // Excluded from dispatchCommand so only the server can send these.
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.settlement-cleanup.report"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    intentId: CommandId,
+    attemptId: CommandId,
+    settledAt: Schema.optional(Schema.DateTimeUtc),
+    blocker: Schema.NullOr(SettlementBlocker),
+  }),
   // Guest share commands the server issues after checking T3 Connect and the guest token.
   Schema.Struct({
     type: Schema.Literal("thread.guest-share.open"),

@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import { reportSettlementFixture } from "./testkit/settlementFixtures.ts";
 import {
   CommandId,
   MessageId,
@@ -1460,7 +1461,7 @@ it.effect("replays a thread.create receipt without changing the thread", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("explicit settle clears snooze atomically and stays idempotent after re-snoozing", () =>
+it.effect("completes a settlement attempt once and clears snooze in the terminal event", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -1481,7 +1482,6 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
       creationSource: "web",
     });
     const now = yield* DateTime.now;
-    const settledAt = DateTime.add(now, { seconds: 1 });
     const snoozedUntil = DateTime.add(now, { hours: 1 });
     for (const round of [1, 2]) {
       yield* orchestrator.dispatch({
@@ -1497,16 +1497,21 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
       yield* TestClock.adjust("1 second");
       const commandId = CommandId.make(`settle-snoozed-${round}`);
       yield* orchestrator.dispatch({ type: "thread.settle", commandId, threadId });
+      assert.isNull((yield* projections.getThread(threadId)).settledAt);
+      const report = yield* reportSettlementFixture(orchestrator, threadId);
       const expected = {
         settledOverride: "settled",
-        settledAt,
+        settledAt: yield* DateTime.now,
         snoozedUntil: null,
         snoozedAt: null,
         updatedAt: yield* DateTime.now,
       } as const;
-      const committed = yield* events.readByCommandId({ commandId }).pipe(Stream.runCollect);
+      const committed = yield* events
+        .readByCommandId({ commandId: CommandId.make(`server:settlement-cleanup:${commandId}`) })
+        .pipe(Stream.runCollect);
       assert.lengthOf(committed, 1);
       assert.equal(committed[0]?.event.type, "thread.settled");
+      assert.equal(committed[0]?.sequence, report.sequence);
       assert.deepInclude(committed[0]?.event.payload, expected);
       const settled = yield* projections.getThreadShell(threadId);
       assert.deepInclude(settled, expected);
@@ -1519,6 +1524,13 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
         threadId,
       });
       assert.deepEqual(yield* projections.getThreadShell(threadId), settled);
+      if (round === 1)
+        yield* orchestrator.dispatch({
+          type: "thread.unsettle",
+          commandId: CommandId.make("unsettle-for-second-cleanup"),
+          threadId,
+          reason: "user",
+        });
     }
     yield* orchestrator.dispatch({
       type: "thread.unsettle",
@@ -1534,6 +1546,80 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
     } as const;
     assert.deepInclude(yield* projections.getThreadShell(threadId), active);
     assert.deepInclude((yield* projections.getThreadProjection(threadId)).thread, active);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("keeps a blocked settlement open and retries only its observed attempt", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:settlement-retry");
+    const intentId = CommandId.make("settlement-intent");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-settlement-retry"),
+      threadId,
+      projectId: ProjectId.make("project:settlement-retry"),
+      title: "Blocked checkout",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const original = { type: "thread.settle", commandId: intentId, threadId } as const;
+    yield* orchestrator.dispatch(original);
+    const blocker = {
+      reason: "Ignored files require review.",
+      remaining: [{ kind: "worktree", id: "/managed/repo/worker" }],
+    } as const;
+    yield* orchestrator.dispatch({
+      type: "thread.settlement-cleanup.report",
+      commandId: CommandId.make("report-settlement-blocker"),
+      threadId,
+      intentId,
+      attemptId: intentId,
+      blocker,
+    });
+    const blocked = yield* projections.getThreadShell(threadId);
+    assert.isNull(blocked?.settledAt);
+    assert.deepEqual(blocked?.settlementCleanup, {
+      intentId,
+      attemptId: intentId,
+      state: { type: "blocked", ...blocker },
+    });
+    yield* orchestrator.dispatch({ ...original, commandId: CommandId.make("group-settle-resend") });
+    assert.deepEqual(
+      (yield* projections.getThreadShell(threadId))?.settlementCleanup,
+      blocked?.settlementCleanup,
+    );
+    const retry = {
+      ...original,
+      commandId: CommandId.make("retry-settlement"),
+      retryCleanup: { intentId, attemptId: intentId },
+    };
+    const accepted = yield* orchestrator.dispatch(retry);
+    const replay = yield* orchestrator.dispatch(retry);
+    assert.deepEqual(replay, { ...accepted, replayed: true });
+    assert.instanceOf(
+      yield* orchestrator
+        .dispatch({
+          ...retry,
+          commandId: CommandId.make("stale-settlement"),
+        })
+        .pipe(Effect.flip),
+      Orchestrator.OrchestratorDispatchError,
+    );
+    yield* reportSettlementFixture(orchestrator, threadId);
+    const settled = yield* projections.getThreadShell(threadId);
+    assert.equal(settled?.settledOverride, "settled");
+    assert.deepEqual(settled?.settlementCleanup, {
+      intentId,
+      attemptId: retry.commandId,
+      state: { type: "complete" },
+    });
   }).pipe(Effect.provide(layerTest)),
 );
 

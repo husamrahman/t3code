@@ -204,6 +204,11 @@ Inherit follows each machine's rules; Off keeps that project's worktrees until y
 manually. Custom applies separate worktree rules to the selected project or checkout. Browser
 captures and log retention remain machine-wide.
 
+The settlement gate runs separately from these retention rules. When you settle a thread on this
+fork, T3 checks whether it can remove the thread's disposable worktree before confirming the
+action. It keeps staged, unstaged, untracked, and ignored files. If cleanup blocks, the thread
+stays open and you can retry after resolving the reported reason.
+
 Worktrees can be removed after a chosen number of inactive days, after a thread settles, after
 merging, or when they have no commits beyond the default branch. Set settled retention to 0 days
 to remove a worktree at the next cleanup after settlement. In repositories without remotes,

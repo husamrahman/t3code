@@ -1,4 +1,5 @@
 import {
+  PreviewSettlementError,
   type PreviewCloseInput,
   type PreviewEvent,
   type PreviewError,
@@ -28,6 +29,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { PreviewControlRequiredError } from "@t3tools/contracts";
+import * as SettlementResourceAdmission from "../orchestration-v2/SettlementResourceAdmission.ts";
 
 export class PreviewManager extends Context.Service<
   PreviewManager,
@@ -197,6 +199,10 @@ export const make = Effect.gen(function* PreviewManagerMake() {
       };
       yield* SynchronizedRef.modifyEffect(stateRef, (state) =>
         Effect.gen(function* () {
+          const admission = yield* SettlementResourceAdmission.SettlementResourceAdmission;
+          if (!(yield* admission.permitsStart(input.threadId))) {
+            return yield* new PreviewSettlementError({ threadId: input.threadId });
+          }
           const revision = state.revision + 1;
           const sessions = new Map(state.sessions);
           sessions.set(compositeKey(input.threadId, tabId), {

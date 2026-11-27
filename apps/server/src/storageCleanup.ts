@@ -126,7 +126,12 @@ export function storageCleanupThreadIdle(
   now: number,
   settings: LimitRecoverySettings,
 ): boolean {
-  return thread.worktreePath !== null && threadIdle(thread, now, settings);
+  return (
+    thread.worktreePath !== null &&
+    thread.settlementCleanup?.state.type !== "pending" &&
+    thread.settlementCleanup?.state.type !== "blocked" &&
+    threadIdle(thread, now, settings)
+  );
 }
 
 function threadIdle(

@@ -98,9 +98,9 @@ notification, so the [PR sync reactor](../../apps/server/src/orchestration-v2/Pu
 re-reads a thread's open links when a run that ran a merge or close command ends. Each forge's
 definition names its CLI's commands in `changeRequestCloseCommand`. The guarded
 `thread.auto-settle` command rejects newer activity, explicit settlement overrides, and live or
-blocked work. It records the activity timestamp for stable
-sorting and detaches idle provider sessions. Clients render the persisted result; they do not
-derive settlement from their own clocks or PR caches.
+blocked work. It records the activity timestamp for stable sorting. Explicit and automatic
+settlement use the same [cleanup gate](thread-settlement-cleanup.md). Clients render the
+persisted result using the server's projection.
 
 ## Waiting for asynchronous work
 

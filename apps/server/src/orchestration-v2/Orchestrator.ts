@@ -89,6 +89,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -548,6 +549,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.guest-message.submit":
     case "thread.guest-message.dismiss":
     case "thread.settle":
+    case "thread.settlement-cleanup.report":
     case "thread.auto-settle":
     case "thread.unsettle":
     case "thread.snooze":
@@ -1646,6 +1648,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
+        projection.thread.settlementCleanup?.state.type === "pending" ||
+        projection.thread.settlementCleanup?.state.type === "blocked" ||
         projection.runs.some(isActiveRun)
       ) {
         return;
@@ -3131,6 +3135,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     >,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    cleanupComplete = false,
   ) {
     const thread = yield* projectionStore.getThread(command.threadId).pipe(
       Effect.mapError(
@@ -3324,6 +3329,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     }
     if (command.type === "thread.settle") {
+      const cleanup = thread.settlementCleanup;
+      if (!cleanupComplete) {
+        if (command.retryCleanup !== undefined) {
+          if (
+            cleanup?.state.type !== "blocked" ||
+            cleanup.intentId !== command.retryCleanup.intentId ||
+            cleanup.attemptId !== command.retryCleanup.attemptId
+          ) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "The blocked settlement attempt changed. Read the thread before retrying.",
+            });
+          }
+        } else if (
+          cleanup?.state.type === "pending" ||
+          cleanup?.state.type === "blocked" ||
+          thread.settledOverride === "settled"
+        ) {
+          return;
+        }
+      }
       const projection = yield* loadProjectionForCommand(
         command,
         ["runs", "runtimeRequests", "messages"],
@@ -3391,6 +3418,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           events,
         );
       }
+      if (!cleanupComplete) {
+        const now = yield* DateTime.now;
+        const intentId = command.retryCleanup?.intentId ?? command.commandId;
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "thread.metadata-updated",
+          threadId: thread.id,
+          occurredAt: now,
+          payload: {
+            ...thread,
+            settlementCleanup: {
+              intentId,
+              attemptId: command.commandId,
+              state: { type: "pending" },
+            },
+            updatedAt: now,
+          },
+        });
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:thread.settlement.cleanup`,
+            commandId: command.commandId,
+            threadId: thread.id,
+            request: {
+              type: "thread.settlement.cleanup",
+              intentId,
+              ...(command.settledAt === undefined ? {} : { settledAt: command.settledAt }),
+            },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
+        return;
+      }
     }
 
     const needsProviderState =
@@ -3398,7 +3460,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.type === "thread.model-selection.set" ||
       command.type === "provider.switch" ||
       command.type === "thread.archive" ||
-      command.type === "thread.settle" ||
       (command.type === "thread.metadata.update" &&
         command.worktreePath !== undefined &&
         command.worktreePath !== thread.worktreePath);
@@ -3553,6 +3614,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             thread.settledOverride === "settled" && thread.settledAt !== null && !wasPinned;
           return {
             ...thread,
+            settlementCleanup: thread.settlementCleanup
+              ? { ...thread.settlementCleanup, state: { type: "complete" } }
+              : null,
             settledOverride: "settled",
             settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
             pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
@@ -4175,10 +4239,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       yield* closePendingLinkRequests({ command, events, threadId: command.threadId, now });
     }
 
-    // Archive and settle stop idle background work; serialized commands prevent starts racing detach.
-    // Settlement rejects active or blocked runs.
+    // Settlement detaches providers before committing its terminal event.
     const detachSessionIds = new Set(
-      command.type === "thread.archive" || command.type === "thread.settle"
+      command.type === "thread.archive"
         ? (providerContext?.providerSessions ?? []).map((session) => session.id)
         : command.type === "thread.metadata.update" &&
             command.worktreePath !== undefined &&
@@ -4218,13 +4281,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 reason:
                   command.type === "thread.archive"
                     ? "Thread archived."
-                    : command.type === "thread.settle"
-                      ? "Thread settled."
-                      : command.type === "thread.metadata.update"
-                        ? "Workspace changed."
-                        : command.type === "thread.runtime-mode.set"
-                          ? "Runtime mode changed."
-                          : "Provider or model selection changed.",
+                    : command.type === "thread.metadata.update"
+                      ? "Workspace changed."
+                      : command.type === "thread.runtime-mode.set"
+                        ? "Runtime mode changed."
+                        : "Provider or model selection changed.",
               },
             });
             const pendingEffect = {
@@ -4237,13 +4298,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 detail:
                   command.type === "thread.archive"
                     ? "Thread archived."
-                    : command.type === "thread.settle"
-                      ? "Thread settled."
-                      : command.type === "thread.metadata.update"
-                        ? "Workspace changed."
-                        : command.type === "thread.runtime-mode.set"
-                          ? "Runtime mode changed."
-                          : "Provider or model selection changed.",
+                    : command.type === "thread.metadata.update"
+                      ? "Workspace changed."
+                      : command.type === "thread.runtime-mode.set"
+                        ? "Runtime mode changed."
+                        : "Provider or model selection changed.",
                 // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
                 ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
               },
@@ -4455,6 +4514,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     // Only side chat forks lock the source; validate the modes copied here, not an earlier read.
     yield* refuseAboveDispatchModeLimit(command, command.sourceThreadId, sourceProjection.thread);
+    const settlementState = sourceProjection.thread.settlementCleanup?.state.type;
+    if (
+      command.sideChat === true &&
+      (settlementState === "pending" || settlementState === "blocked")
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "The parent thread is waiting for settlement cleanup.",
+      });
+    }
     if (command.sideChat === true && sourceProjection.thread.deletedAt !== null) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
@@ -13098,6 +13168,52 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       | undefined;
     let updateDelegatedCompletionOnlyRunId: RunId | undefined;
+    if (
+      (command.type === "thread.create" || command.type === "thread.metadata.update") &&
+      command.worktreePath != null
+    ) {
+      const { threads, archivedThreads } = yield* projectionStore
+        .getShellSnapshot({ worktreePath: path.resolve(command.worktreePath) })
+        .pipe(mapDispatchError(command));
+      if (
+        [...threads, ...archivedThreads].some(
+          ({ settlementCleanup }) =>
+            settlementCleanup?.state.type === "pending" ||
+            settlementCleanup?.state.type === "blocked",
+        )
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "The worktree is waiting for settlement cleanup.",
+        });
+      }
+    }
+    if (
+      command.type === "message.dispatch" ||
+      command.type === "thread.guest-message.submit" ||
+      command.type === "notification.delivery.accept" ||
+      command.type === "queued-run.start" ||
+      command.type === "queue.resume" ||
+      command.type === "checkpoint.rollback" ||
+      command.type === "thread.delete" ||
+      command.type === "thread.archive" ||
+      command.type === "thread.unsettle" ||
+      command.type === "thread.project.adopt-folder" ||
+      (command.type === "thread.metadata.update" &&
+        (command.worktreePath !== undefined || command.branch !== undefined))
+    ) {
+      const thread = yield* findThread(command.threadId).pipe(mapDispatchError(command));
+      const state = thread?.settlementCleanup?.state.type;
+      if (state === "pending" || state === "blocked") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Settlement cleanup must finish before the thread can change workspaces or resume work.",
+        });
+      }
+    }
     switch (command.type) {
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
@@ -13105,6 +13221,65 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.visit":
         yield* dispatchThreadVisit(command, events);
         break;
+      case "thread.settlement-cleanup.report": {
+        const { thread, providerSessions: sessions } = yield* projectionStore
+          .getThreadProviderContext(command.threadId)
+          .pipe(mapDispatchError(command));
+        const cleanup = thread.settlementCleanup;
+        if (
+          cleanup?.state.type !== "pending" ||
+          cleanup.intentId !== command.intentId ||
+          cleanup.attemptId !== command.attemptId
+        )
+          break;
+        if (command.blocker !== null) {
+          const now = yield* DateTime.now;
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: thread.id,
+            occurredAt: now,
+            payload: {
+              ...thread,
+              settlementCleanup: { ...cleanup, state: { type: "blocked", ...command.blocker } },
+              updatedAt: now,
+            },
+          });
+          break;
+        }
+        const now = yield* DateTime.now;
+        for (const session of sessions) {
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "provider-session.detached",
+            threadId: thread.id,
+            driver: session.driver,
+            providerInstanceId: session.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              providerSessionId: session.id,
+              detachedAt: now,
+              reason: "Settlement cleanup completed.",
+            },
+          });
+        }
+        yield* dispatchThreadMutation(
+          {
+            type: "thread.settle",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            ...(command.settledAt === undefined ? {} : { settledAt: command.settledAt }),
+          },
+          events,
+          effects,
+          true,
+        );
+        break;
+      }
       case "thread.auto-settle": {
         // Recheck live state; changes and explicit overrides take precedence over the sweep snapshot.
         const thread = yield* projectionStore
@@ -13570,6 +13745,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Effect.filterOrFail(
         (planned) =>
           planned.events.length > 0 ||
+          command.type === "thread.settle" ||
+          command.type === "thread.auto-settle" ||
+          command.type === "thread.settlement-cleanup.report" ||
           command.type === "thread.background-work.settle" ||
           command.type === "thread.interrupt.unresponsive" ||
           command.type === "thread.stop" ||
@@ -13741,6 +13919,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       commandThreadId(command),
       dispatchWithReceiptEffect(command),
     );
+    const boundWorktree =
+      command.type === "thread.create" || command.type === "thread.metadata.update"
+        ? command.worktreePath
+        : null;
+    if (boundWorktree != null) {
+      return yield* withWorkspaceLease(path.resolve(boundWorktree), dispatch);
+    }
     // A parent's lock comes before its side chats' locks, so a delete cascade and a side chat
     // fork or command never interleave. A fork from a side chat or onto an existing thread would
     // invert that order; dispatch rejects both, so they skip the source lock.

@@ -373,6 +373,9 @@ export interface ThreadManagementServiceShape {
     Orchestrator.OrchestratorV2DispatchResult,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
+  readonly waitForSettlement: (
+    command: Extract<OrchestrationV2Command, { type: "thread.settle" }>,
+  ) => Effect.Effect<void, Orchestrator.OrchestratorV2Error>;
   readonly getThreadHistoryPage: Orchestrator.OrchestratorV2["Service"]["getThreadHistoryPage"];
   readonly getTimelinePage: Orchestrator.OrchestratorV2["Service"]["getTimelinePage"];
   readonly getMessageCount: Orchestrator.OrchestratorV2["Service"]["getMessageCount"];
@@ -1041,11 +1044,38 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const waitForSettlement: ThreadManagementServiceShape["waitForSettlement"] = Effect.fn(
+    "ThreadManagementService.waitForSettlement",
+  )(function* (command) {
+    const fail = (cause: string) =>
+      new Orchestrator.OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause,
+      });
+    return yield* Effect.gen(function* () {
+      for (;;) {
+        const shell = yield* orchestrator.getThreadShell(command.threadId);
+        if (shell?.settledOverride === "settled") return;
+        const cleanup = shell?.settlementCleanup;
+        if (cleanup?.state.type === "blocked") return yield* fail(cleanup.state.reason);
+        if (cleanup?.state.type !== "pending")
+          return yield* fail("Settlement is no longer pending.");
+        yield* Effect.sleep(Duration.millis(100));
+      }
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: Duration.seconds(12),
+        orElse: () => Effect.fail(fail("Settlement cleanup is still pending.")),
+      }),
+    );
+  });
+
   const settleThread: ThreadManagementServiceShape["settleThread"] = Effect.fn(
     "orchestrationV2.threadManagement.settleThread",
   )(function* (input) {
-    const shell = input.byOwnAgent ? yield* orchestrator.getThreadShell(input.threadId) : null;
-    if (shell != null && shell.activeRunId !== null) {
+    const shell = yield* orchestrator.getThreadShell(input.threadId);
+    if (input.byOwnAgent && shell != null && shell.activeRunId !== null) {
       yield* settleAfterRun({
         projectId: shell.projectId,
         threadId: shell.id,
@@ -1053,11 +1083,17 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(layerScope));
       return { settlesWhenTurnEnds: true } as const;
     }
-    const result = yield* dispatch({
-      type: "thread.settle",
+    const cleanup = shell?.settlementCleanup;
+    const command = {
+      type: "thread.settle" as const,
       commandId: input.commandId,
       threadId: input.threadId,
-    });
+      ...(cleanup?.state.type === "blocked"
+        ? { retryCleanup: { intentId: cleanup.intentId, attemptId: cleanup.attemptId } }
+        : {}),
+    };
+    const result = yield* dispatch(command);
+    yield* waitForSettlement(command);
     return { sequence: result.sequence };
   });
 
@@ -1542,6 +1578,7 @@ const make = Effect.gen(function* () {
     waitForThread,
     settleAfterRun,
     settleThread,
+    waitForSettlement,
     interruptThread,
     stopDelegatedTasks,
     stopWorkflow,
