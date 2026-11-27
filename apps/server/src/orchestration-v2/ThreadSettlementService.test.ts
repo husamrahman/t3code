@@ -1385,3 +1385,27 @@ describe("ThreadSettlementServiceV2 worker", () => {
     ),
   );
 });
+describe("isSnoozed", () => {
+  const snoozed = { snoozedAt: at(-2 * DAY_MS), snoozedUntil: at(DAY_MS) };
+  it("keeps a run requested and completed after snoozing parked until the timer", () => {
+    const thread = shell({
+      ...snoozed,
+      status: "completed",
+      latestRunRequestedAt: at(-2 * DAY_MS + 1),
+      latestRunStartedAt: at(-DAY_MS - 1),
+      latestRunCompletedAt: at(-DAY_MS),
+    });
+
+    expect(ThreadSettlementService.isSnoozed(thread, NOW_MS)).toBe(true);
+    expect(ThreadSettlementService.isAutoSettlementCandidate(thread, NOW_MS)).toBe(false);
+    expect(
+      ThreadSettlementService.resolveAutoSettlementAt({
+        thread,
+        pullRequest: { state: "merged", mergedAt: DateTime.formatIso(at(-1)) },
+        nowMs: NOW_MS,
+        autoSettleAfterDays: null,
+        autoSettleOnMerge: true,
+      }),
+    ).toBeNull();
+  });
+});

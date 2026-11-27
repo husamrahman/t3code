@@ -40,6 +40,7 @@ import {
   interruptThreadTurn,
   revertThreadCheckpoint,
   resumeThreadQueue,
+  settleThread,
   startThreadTurn,
 } from "./commands.ts";
 
@@ -131,6 +132,34 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("V2 environment commands", () => {
+  it.effect("retries the observed blocked cleanup and waits for the interactive result", () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({ commands, projects: [] });
+      const threadId = ThreadId.make("blocked-thread");
+      const commandId = CommandId.make("interactive-retry");
+      const intentId = CommandId.make("settle-intent");
+      const attemptId = CommandId.make("blocked-attempt");
+      yield* settleThread({
+        commandId,
+        threadId,
+        settlementCleanup: {
+          intentId,
+          attemptId,
+          state: { type: "blocked", reason: "Ignored files.", remaining: [] },
+        },
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+      expect(commands).toEqual([
+        {
+          type: "thread.settle",
+          commandId,
+          threadId,
+          retryCleanup: { intentId, attemptId },
+          acknowledgeCleanup: false,
+        },
+      ]);
+    }).pipe(Effect.provide(layerTestRandom)),
+  );
   it.effect("distinguishes sending a selected queued message from resuming queue order", () =>
     Effect.gen(function* () {
       const commands: OrchestrationV2Command[] = [];

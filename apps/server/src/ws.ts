@@ -2035,7 +2035,7 @@ export const layerWsRpc = (
                   Effect.tap(() =>
                     command.type === "thread.settle" &&
                     command.acknowledgeCleanup !== true &&
-                    command.retryCleanup === undefined
+                    (command.retryCleanup === undefined || command.acknowledgeCleanup === false)
                       ? threadManagement.waitForSettlement(command)
                       : Effect.void,
                   ),

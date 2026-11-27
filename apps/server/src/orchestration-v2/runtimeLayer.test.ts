@@ -1948,6 +1948,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         commandId: CommandId.make("runtime-settle-question-command"),
         threadId: settled.threadId,
       });
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(settled.threadId)).runtimeRequests[0]?.status,
+        "pending",
+      );
       yield* reportSettlementFixture(orchestrator, settled.threadId);
       const settledProjection = yield* orchestrator.getThreadProjection(settled.threadId);
       assert.equal(settledProjection.thread.settledOverride, "settled");

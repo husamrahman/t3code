@@ -40,6 +40,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const instanceId = ProviderInstanceId.make("codex");
@@ -1549,18 +1550,106 @@ it.effect("completes a settlement attempt once and clears snooze in the terminal
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("keeps a blocked settlement open and retries only its observed attempt", () =>
+it.effect(
+  "keeps an automatically blocked settlement open and retries only its observed attempt",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:settlement-retry");
+      const intentId = CommandId.make("settlement-intent");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-settlement-retry"),
+        threadId,
+        projectId: ProjectId.make("project:settlement-retry"),
+        title: "Blocked checkout",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const original = { type: "thread.settle", commandId: intentId, threadId } as const;
+      yield* orchestrator.dispatch({
+        ...original,
+        type: "thread.auto-settle",
+        snapshotAt: (yield* projections.getThread(threadId)).updatedAt,
+      });
+      const blocker = {
+        reason: "Ignored files require review.",
+        remaining: [{ kind: "worktree", id: "/managed/repo/worker" }],
+      } as const;
+      yield* orchestrator.dispatch({
+        type: "thread.settlement-cleanup.report",
+        commandId: CommandId.make("report-settlement-blocker"),
+        threadId,
+        intentId,
+        attemptId: intentId,
+        blocker,
+      });
+      const blocked = yield* projections.getThreadShell(threadId);
+      assert.isNull(blocked?.settledAt);
+      assert.deepEqual(blocked?.settlementCleanup, {
+        intentId,
+        attemptId: intentId,
+        state: { type: "blocked", ...blocker },
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.unsettle",
+        commandId: CommandId.make("keep-blocked-thread-open"),
+        threadId,
+        reason: "user",
+      });
+      assert.equal((yield* projections.getThreadShell(threadId))?.settledOverride, "active");
+      yield* orchestrator.dispatch({
+        ...original,
+        commandId: CommandId.make("group-settle-resend"),
+      });
+      assert.deepEqual(
+        (yield* projections.getThreadShell(threadId))?.settlementCleanup,
+        blocked?.settlementCleanup,
+      );
+      const retry = {
+        ...original,
+        commandId: CommandId.make("retry-settlement"),
+        retryCleanup: { intentId, attemptId: intentId },
+      };
+      const accepted = yield* orchestrator.dispatch(retry);
+      const replay = yield* orchestrator.dispatch(retry);
+      assert.deepEqual(replay, { ...accepted, replayed: true });
+      assert.instanceOf(
+        yield* orchestrator
+          .dispatch({
+            ...retry,
+            commandId: CommandId.make("stale-settlement"),
+          })
+          .pipe(Effect.flip),
+        Orchestrator.OrchestratorDispatchError,
+      );
+      yield* reportSettlementFixture(orchestrator, threadId);
+      const settled = yield* projections.getThreadShell(threadId);
+      assert.equal(settled?.settledOverride, "settled");
+      assert.deepEqual(settled?.settlementCleanup, {
+        intentId,
+        attemptId: retry.commandId,
+        state: { type: "complete" },
+      });
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("rejects preparation retry during settlement", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
-    const projections = yield* ProjectionStore.ProjectionStoreV2;
-    const threadId = ThreadId.make("thread:settlement-retry");
-    const intentId = CommandId.make("settlement-intent");
+    const threadId = ThreadId.make("thread:settlement-preparation");
     yield* orchestrator.dispatch({
       type: "thread.create",
-      commandId: CommandId.make("create-settlement-retry"),
+      commandId: CommandId.make("create-settlement-preparation"),
       threadId,
-      projectId: ProjectId.make("project:settlement-retry"),
-      title: "Blocked checkout",
+      projectId: ProjectId.make("project:settlement-preparation"),
+      title: "Prepare checkout",
       modelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
@@ -1569,57 +1658,112 @@ it.effect("keeps a blocked settlement open and retries only its observed attempt
       createdBy: "user",
       creationSource: "web",
     });
-    const original = { type: "thread.settle", commandId: intentId, threadId } as const;
-    yield* orchestrator.dispatch(original);
-    const blocker = {
-      reason: "Ignored files require review.",
-      remaining: [{ kind: "worktree", id: "/managed/repo/worker" }],
-    } as const;
     yield* orchestrator.dispatch({
-      type: "thread.settlement-cleanup.report",
-      commandId: CommandId.make("report-settlement-blocker"),
+      type: "message.dispatch",
+      commandId: CommandId.make("prepare-settlement"),
       threadId,
-      intentId,
-      attemptId: intentId,
-      blocker,
+      messageId: MessageId.make("msg:settlement-preparation"),
+      text: "Prepare a checkout.",
+      attachments: [],
+      modelSelection,
+      dispatchMode: {
+        type: "defer_start",
+        workspaceStrategy: { type: "worktree", baseRef: "main" },
+      },
+      createdBy: "user",
+      creationSource: "web",
     });
-    const blocked = yield* projections.getThreadShell(threadId);
-    assert.isNull(blocked?.settledAt);
-    assert.deepEqual(blocked?.settlementCleanup, {
-      intentId,
-      attemptId: intentId,
-      state: { type: "blocked", ...blocker },
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    yield* orchestrator.dispatch({
+      type: "prepared-run.fail",
+      commandId: CommandId.make("fail-settlement-preparation"),
+      threadId,
+      runId: run.id,
+      failure: { class: "validation_error", message: "No checkout.", code: null, retryable: true },
     });
-    yield* orchestrator.dispatch({ ...original, commandId: CommandId.make("group-settle-resend") });
-    assert.deepEqual(
-      (yield* projections.getThreadShell(threadId))?.settlementCleanup,
-      blocked?.settlementCleanup,
-    );
-    const retry = {
-      ...original,
-      commandId: CommandId.make("retry-settlement"),
-      retryCleanup: { intentId, attemptId: intentId },
-    };
-    const accepted = yield* orchestrator.dispatch(retry);
-    const replay = yield* orchestrator.dispatch(retry);
-    assert.deepEqual(replay, { ...accepted, replayed: true });
-    assert.instanceOf(
-      yield* orchestrator
-        .dispatch({
-          ...retry,
-          commandId: CommandId.make("stale-settlement"),
-        })
-        .pipe(Effect.flip),
-      Orchestrator.OrchestratorDispatchError,
-    );
+    yield* orchestrator.dispatch({
+      type: "thread.settle",
+      commandId: CommandId.make("settle-with-failed-preparation"),
+      threadId,
+    });
+    const error = yield* orchestrator
+      .dispatch({
+        type: "prepared-run.retry",
+        commandId: CommandId.make("retry-preparation-during-settlement"),
+        threadId,
+        runId: run.id,
+      })
+      .pipe(Effect.flip);
+    assert.match(userFacingDispatchErrorMessage(error) ?? "", /Settlement cleanup/);
+    assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs[0]?.status, "failed");
     yield* reportSettlementFixture(orchestrator, threadId);
-    const settled = yield* projections.getThreadShell(threadId);
-    assert.equal(settled?.settledOverride, "settled");
-    assert.deepEqual(settled?.settlementCleanup, {
-      intentId,
-      attemptId: retry.commandId,
-      state: { type: "complete" },
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("blocks a regular fork during settlement and never copies completed cleanup to it", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:settling-fork-source");
+    const targetThreadId = ThreadId.make("thread:settlement-fork");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-settling-fork-source"),
+      threadId,
+      projectId: ProjectId.make("project:settling-fork-source"),
+      title: "Fork source",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "topic",
+      worktreePath: "/managed/repo/fork-source",
+      createdBy: "user",
+      creationSource: "web",
     });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("turn-before-settling-fork"),
+      threadId,
+      messageId: MessageId.make("msg:turn-before-settling-fork"),
+      text: "Complete work.",
+      attachments: [],
+      modelSelection,
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    const now = yield* DateTime.now;
+    yield* projections.apply({
+      type: "run.updated",
+      id: EventId.make("run-completed-before-settling-fork"),
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: { ...run, status: "completed", completedAt: now },
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.settle",
+      commandId: CommandId.make("settle-before-fork"),
+      threadId,
+    });
+    const fork = {
+      type: "thread.fork",
+      commandId: CommandId.make("fork-during-settlement"),
+      sourceThreadId: threadId,
+      targetThreadId,
+      sourcePoint: { type: "run", runId: run.id },
+      createdBy: "user",
+      creationSource: "web",
+    } as const;
+    const forkError = yield* orchestrator.dispatch(fork).pipe(Effect.flip);
+    assert.match(userFacingDispatchErrorMessage(forkError) ?? "", /settlement cleanup/);
+    yield* reportSettlementFixture(orchestrator, threadId);
+    yield* orchestrator.dispatch({
+      ...fork,
+      commandId: CommandId.make("fork-after-settlement"),
+    });
+    assert.isNull((yield* projections.getThreadShell(targetThreadId))?.settlementCleanup);
   }).pipe(Effect.provide(layerTest)),
 );
 

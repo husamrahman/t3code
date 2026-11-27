@@ -6,6 +6,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CONFIGURED_LOCAL_SERVER_URLS_MAX_ITEMS,
   PREVIEW_URL_MAX_LENGTH,
+  ThreadId,
   type DiscoveredLocalServer,
 } from "@t3tools/contracts";
 import * as ProcessGroup from "@t3tools/provider-core/server/processGroup";
@@ -826,7 +827,7 @@ server.listen(0, "127.0.0.1", () => {
  * job: under a detached shell with job control, in a group of its own. Release kills only the pids
  * it started.
  */
-const agentServer = () =>
+const agentServer = (threadId = "thread-live") =>
   Effect.acquireRelease(
     Effect.callback<{
       readonly child: NodeChildProcess.ChildProcess;
@@ -834,11 +835,18 @@ const agentServer = () =>
       readonly port: number;
       readonly exited: Promise<void>;
     }>((resume) => {
-      const env = { ...process.env, [PortScanner.AGENT_THREAD_ENV]: "thread-live" };
+      const env = { ...process.env };
+      delete env[PortScanner.AGENT_THREAD_ENV];
       // dash ignores `set -m` without a terminal; bash, like agent tool shells, honors it.
       const child = NodeChildProcess.spawn(
         "bash",
-        ["-c", 'set -m; "$0" -e "$1" & wait', process.execPath, AGENT_SERVER_SCRIPT],
+        [
+          "-c",
+          'set -m; env "$2" "$0" -e "$1" & wait',
+          process.execPath,
+          AGENT_SERVER_SCRIPT,
+          `${PortScanner.AGENT_THREAD_ENV}=${threadId}`,
+        ],
         { detached: true, env, stdio: ["ignore", "pipe", "ignore"] },
       );
       const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
@@ -894,6 +902,30 @@ effectIt.live.skipIf(HostProcess.Platform.defaultValue() === "win32")(
       // The shell waits on its job, so it exits once the job has.
       yield* Effect.promise(() => job.exited);
       expect(isRunning(job.pid)).toBe(false);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        PortScanner.layer.pipe(
+          Layer.provide(ProcessRunner.layer),
+          Layer.provide(Layer.mergeAll(NodeServices.layer, FetchHttpClient.layer)),
+        ),
+      ),
+    ),
+);
+
+effectIt.live.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
+  "verifies settlement stopped only the selected thread's processes",
+  () =>
+    Effect.gen(function* () {
+      const scanner = yield* PortScanner.PortDiscovery;
+      const owner = ThreadId.make("thread-settlement-owner");
+      const job = yield* agentServer(owner);
+      const unrelated = yield* agentServer("thread-settlement-unrelated");
+      yield* scanner.stopThreadProcesses(owner);
+      yield* Effect.promise(() => job.exited);
+      expect(isRunning(job.pid)).toBe(false);
+      expect(isRunning(unrelated.pid)).toBe(true);
+      yield* scanner.stopThreadProcesses(owner);
     }).pipe(
       Effect.scoped,
       Effect.provide(

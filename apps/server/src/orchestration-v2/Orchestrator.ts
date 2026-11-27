@@ -1649,7 +1649,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.thread.settlementCleanup?.state.type === "pending" ||
-        projection.thread.settlementCleanup?.state.type === "blocked" ||
         projection.runs.some(isActiveRun)
       ) {
         return;
@@ -3394,30 +3393,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
-      for (const request of pendingRequests) {
-        yield* dispatchRuntimeRequestRespond(
-          {
-            type: "runtime-request.respond",
-            commandId: command.commandId,
-            threadId: command.threadId,
-            requestId: request.id,
-            decision: "cancel",
-          },
-          events,
-          effects,
-        );
-      }
-      for (const run of automaticQueuedRuns) {
-        yield* dispatchQueuedRunCancel(
-          {
-            type: "queued-run.cancel",
-            commandId: command.commandId,
-            threadId: command.threadId,
-            runId: run.id,
-          },
-          events,
-        );
-      }
       if (!cleanupComplete) {
         const now = yield* DateTime.now;
         const intentId = command.retryCleanup?.intentId ?? command.commandId;
@@ -3452,6 +3427,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           } satisfies PendingOrchestrationEffectV2,
         ]);
         return;
+      }
+
+      for (const request of pendingRequests) {
+        yield* dispatchRuntimeRequestRespond(
+          {
+            type: "runtime-request.respond",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            requestId: request.id,
+            decision: "cancel",
+          },
+          events,
+          effects,
+        );
+      }
+      for (const run of automaticQueuedRuns) {
+        yield* dispatchQueuedRunCancel(
+          {
+            type: "queued-run.cancel",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            runId: run.id,
+          },
+          events,
+        );
       }
     }
 
@@ -4512,17 +4512,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-    // Only side chat forks lock the source; validate the modes copied here, not an earlier read.
     yield* refuseAboveDispatchModeLimit(command, command.sourceThreadId, sourceProjection.thread);
     const settlementState = sourceProjection.thread.settlementCleanup?.state.type;
-    if (
-      command.sideChat === true &&
-      (settlementState === "pending" || settlementState === "blocked")
-    ) {
+    if (settlementState === "pending" || settlementState === "blocked") {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
-        cause: "The parent thread is waiting for settlement cleanup.",
+        cause: "The source thread is waiting for settlement cleanup.",
       });
     }
     if (command.sideChat === true && sourceProjection.thread.deletedAt !== null) {
@@ -13189,23 +13185,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
     }
+    const changesWorkspaceOrRemovesThread =
+      command.type === "thread.delete" ||
+      command.type === "thread.archive" ||
+      command.type === "thread.project.adopt-folder" ||
+      (command.type === "thread.metadata.update" &&
+        (command.worktreePath !== undefined || command.branch !== undefined));
     if (
       command.type === "message.dispatch" ||
       command.type === "thread.guest-message.submit" ||
       command.type === "notification.delivery.accept" ||
+      command.type === "runtime-request.respond" ||
+      command.type === "prepared-run.retry" ||
+      command.type === "queued-message.promote-to-steer" ||
       command.type === "queued-run.start" ||
       command.type === "queue.resume" ||
       command.type === "checkpoint.rollback" ||
-      command.type === "thread.delete" ||
-      command.type === "thread.archive" ||
       command.type === "thread.unsettle" ||
-      command.type === "thread.project.adopt-folder" ||
-      (command.type === "thread.metadata.update" &&
-        (command.worktreePath !== undefined || command.branch !== undefined))
+      changesWorkspaceOrRemovesThread
     ) {
       const thread = yield* findThread(command.threadId).pipe(mapDispatchError(command));
       const state = thread?.settlementCleanup?.state.type;
-      if (state === "pending" || state === "blocked") {
+      if (state === "pending" || (state === "blocked" && changesWorkspaceOrRemovesThread)) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
@@ -13926,19 +13927,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (boundWorktree != null) {
       return yield* withWorkspaceLease(path.resolve(boundWorktree), dispatch);
     }
-    // A parent's lock comes before its side chats' locks, so a delete cascade and a side chat
-    // fork or command never interleave. A fork from a side chat or onto an existing thread would
-    // invert that order; dispatch rejects both, so they skip the source lock.
-    if (
-      command.type === "thread.fork" &&
-      command.sideChat === true &&
-      command.sourceThreadId !== command.targetThreadId
-    ) {
+    // Hold the workspace first, then the source and new thread. Existing targets could invert
+    // that order and are already rejected by the fork command.
+    if (command.type === "thread.fork" && command.sourceThreadId !== command.targetThreadId) {
       const source = yield* findThread(command.sourceThreadId);
       const target = yield* findThread(command.targetThreadId);
-      return yield* source === null || source.lineage.sideChat === true || target !== null
-        ? dispatch
-        : threadDispatch.withLock(command.sourceThreadId, dispatch);
+      if (
+        source === null ||
+        target !== null ||
+        (command.sideChat === true && source.lineage.sideChat === true)
+      ) {
+        return yield* dispatch;
+      }
+      const fork = threadDispatch.withLock(
+        command.sourceThreadId,
+        Effect.gen(function* () {
+          const current = yield* findThread(command.sourceThreadId);
+          if (current?.worktreePath !== source.worktreePath) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "The source thread changed workspaces. Retry the fork.",
+            });
+          }
+          return yield* dispatch;
+        }),
+      );
+      return yield* source.worktreePath === null
+        ? fork
+        : withWorkspaceLease(path.resolve(source.worktreePath), fork);
     }
     if (command.type === "thread.delete")
       return yield* threadDispatch.withLock(

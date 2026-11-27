@@ -2984,7 +2984,7 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     settledAt: Schema.optional(Schema.DateTimeUtc),
-    acknowledgeCleanup: Schema.optional(Schema.Literal(true)),
+    acknowledgeCleanup: Schema.optional(Schema.Boolean),
     retryCleanup: Schema.optional(Schema.Struct({ intentId: CommandId, attemptId: CommandId })),
   }),
   /** Rejects changes since snapshotAt or any explicit settled override to preserve user actions. */

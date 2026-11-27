@@ -208,6 +208,8 @@ The settlement gate runs separately from these retention rules. When you settle 
 fork, T3 checks whether it can remove the thread's disposable worktree before confirming the
 action. It keeps staged, unstaged, untracked, and ignored files. If cleanup blocks, the thread
 stays open and you can retry after resolving the reported reason.
+You can keep working or open a terminal while the attempt is blocked. Choose **Settle** again
+to retry the blocked attempt after resolving its cause.
 
 Worktrees can be removed after a chosen number of inactive days, after a thread settles, after
 merging, or when they have no commits beyond the default branch. Set settled retention to 0 days

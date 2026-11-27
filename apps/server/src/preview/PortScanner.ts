@@ -447,7 +447,7 @@ const serversEqual = (
   return true;
 };
 
-const isNoSuchProcess = (cause: unknown): boolean =>
+export const isNoSuchProcess = (cause: unknown): boolean =>
   typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ESRCH";
 
 const isCommandNotFound = (error: ProcessRunner.ProcessSpawnError): boolean =>

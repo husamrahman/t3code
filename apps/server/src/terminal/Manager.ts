@@ -1512,6 +1512,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
 export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(function* (
   options: TerminalManagerOptions,
 ) {
+  const admission = yield* SettlementResourceAdmission.SettlementResourceAdmission;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const context = yield* Effect.context<never>();
@@ -1844,6 +1845,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       Deferred.doneUnsafe(exited, Effect.void);
     });
     return yield* Effect.gen(function* () {
+      if (yield* Deferred.isDone(exited)) return true;
       const terminated = yield* Effect.try({
         try: () => process.kill("SIGTERM"),
         catch: (cause) =>
@@ -1855,12 +1857,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       }).pipe(
         Effect.as(true),
         Effect.catch((error) =>
-          Effect.logWarning("failed to kill terminal process", {
-            threadId,
-            terminalId,
-            signal: "SIGTERM",
-            cause: error,
-          }).pipe(Effect.as(false)),
+          PortScanner.isNoSuchProcess(error.cause)
+            ? Deferred.succeed(exited, undefined).pipe(Effect.as(true))
+            : Effect.logWarning("failed to kill terminal process", {
+                threadId,
+                terminalId,
+                signal: "SIGTERM",
+                cause: error,
+              }).pipe(Effect.as(false)),
         ),
       );
       if (!terminated) {
@@ -1888,12 +1892,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           }),
       }).pipe(
         Effect.catch((error) =>
-          Effect.logWarning("failed to force-kill terminal process", {
-            threadId,
-            terminalId,
-            signal: "SIGKILL",
-            cause: error,
-          }),
+          PortScanner.isNoSuchProcess(error.cause)
+            ? Deferred.succeed(exited, undefined).pipe(Effect.asVoid)
+            : Effect.logWarning("failed to force-kill terminal process", {
+                threadId,
+                terminalId,
+                signal: "SIGKILL",
+                cause: error,
+              }),
         ),
       );
       return verifyExit
@@ -2855,7 +2861,6 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const openWithWorkspaceLease = Effect.fn("terminal.openLocked")(function* (
     requestedInput: TerminalOpenInput,
   ) {
-    const admission = yield* SettlementResourceAdmission.SettlementResourceAdmission;
     if (!(yield* admission.permitsStart(requestedInput.threadId))) {
       return yield* new TerminalSettlementError({
         threadId: requestedInput.threadId,

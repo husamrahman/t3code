@@ -766,7 +766,10 @@ export function useThreadActions() {
     const action = ThreadUndo.begin("settle", scopedThreadKey(target));
     const result = await settleThreadMutation({
       environmentId: target.environmentId,
-      input: { threadId: target.threadId },
+      input: {
+        threadId: target.threadId,
+        settlementCleanup: resolved?.thread.source.settlementCleanup,
+      },
     });
     if (result._tag !== "Success") {
       action.finish();

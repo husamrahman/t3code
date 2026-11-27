@@ -13,6 +13,7 @@ import {
   type NodeId,
   type OrchestrationV2Command,
   type OrchestrationV2CreationSource,
+  type OrchestrationV2ThreadShell,
   type PlanId,
   type ProjectId,
   type ProjectIconOverride,
@@ -90,7 +91,9 @@ export interface DeleteThreadInput extends ThreadCommandInput {
 }
 export type ArchiveThreadInput = ThreadCommandInput;
 export type UnarchiveThreadInput = ThreadCommandInput;
-export type SettleThreadInput = ThreadCommandInput;
+export interface SettleThreadInput extends ThreadCommandInput {
+  readonly settlementCleanup?: OrchestrationV2ThreadShell["settlementCleanup"];
+}
 
 export interface UnsettleThreadInput extends ThreadCommandInput {
   readonly reason: "user";
@@ -416,7 +419,6 @@ function simpleThreadCommand(
   type:
     | "thread.archive"
     | "thread.unarchive"
-    | "thread.settle"
     | "thread.pin"
     | "thread.unpin"
     | "thread.guest-share.close",
@@ -492,7 +494,19 @@ export const unarchiveThread = Effect.fn("EnvironmentCommands.unarchiveThread")(
 export const settleThread = Effect.fn("EnvironmentCommands.settleThread")(function* (
   input: SettleThreadInput,
 ) {
-  return yield* simpleThreadCommand("thread.settle", input);
+  const commandId = yield* allocateCommandId(input);
+  const cleanup = input.settlementCleanup;
+  return yield* dispatch({
+    type: "thread.settle",
+    commandId,
+    threadId: input.threadId,
+    ...(cleanup?.state.type === "blocked"
+      ? {
+          retryCleanup: { intentId: cleanup.intentId, attemptId: cleanup.attemptId },
+          acknowledgeCleanup: false,
+        }
+      : {}),
+  });
 });
 
 export const pinThread = Effect.fn("EnvironmentCommands.pinThread")(function* (

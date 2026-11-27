@@ -21,9 +21,7 @@ export const layer = Layer.effect(
         const shell = yield* projections.getThreadShell(ThreadId.make(threadId));
         const state = shell?.settlementCleanup?.state.type;
         return (
-          state !== "pending" &&
-          state !== "blocked" &&
-          !(state === "complete" && shell?.settledOverride === "settled")
+          state !== "pending" && !(state === "complete" && shell?.settledOverride === "settled")
         );
       },
       Effect.orElseSucceed(() => false),

@@ -46,10 +46,15 @@ deliberate retry with a fresh command ID and the last blocked attempt:
 ```
 
 The receipt acknowledges the retry. Resend the same command ID after a transport timeout.
+Clients that need the result in the same call can set `acknowledgeCleanup: false` on a retry.
 T3 rejects a new retry command whose attempt is stale. Re-read the projection before acting on
 a stale response. Close a recovery item when the matching intent has `state.type: "complete"`
 and the projection confirms settlement. A missing thread or timed-out read leaves the cleanup
 unverified.
+
+The gate holds new work while cleanup is pending. A blocked attempt leaves the thread open
+for work and repair while preserving its blocker and attempt ID. T3 does not cancel queued
+automatic messages or message-mode questions until it can commit settlement.
 
 ## Release and rollback
 

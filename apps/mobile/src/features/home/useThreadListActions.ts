@@ -149,7 +149,12 @@ function useThreadActionExecutor(
                       : deleteMutation
               )({
                 environmentId: thread.environmentId,
-                input: { threadId: thread.id },
+                input: {
+                  threadId: thread.id,
+                  ...(action === "settle"
+                    ? { settlementCleanup: thread.source.settlementCleanup }
+                    : {}),
+                },
               }),
         (result) => result._tag === "Success",
       );
